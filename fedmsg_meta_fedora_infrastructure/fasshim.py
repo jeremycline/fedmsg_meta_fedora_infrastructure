@@ -14,10 +14,10 @@ except ImportError:
     import urllib as parse
 
 
+_log = logging.getLogger(__name__)
+
 _fas_cache = {}
 _fas_cache_lock = threading.Lock()
-
-log = logging.getLogger("moksha.hub")
 
 
 def _ordered_query_params(params):
@@ -97,17 +97,17 @@ def make_fas_cache(**config):
     if _fas_cache:
         return _fas_cache
 
-    log.warn("No previous fas cache found.  Looking to rebuild.")
+    _log.warn("No previous fas cache found.  Looking to rebuild.")
 
     try:
         import fedora.client
         import fedora.client.fas2
     except ImportError:
-        log.warn("No python-fedora installed.  Not caching fas.")
+        _log.warn("No python-fedora installed.  Not caching fas.")
         return {}
 
     if 'fas_credentials' not in config:
-        log.warn("No fas_credentials found.  Not caching fas.")
+        _log.warn("No fas_credentials found.  Not caching fas.")
         return {}
 
     creds = config['fas_credentials']
@@ -123,18 +123,18 @@ def make_fas_cache(**config):
     for key in string.ascii_lowercase:
         socket.setdefaulttimeout(600)
         try:
-            log.info("Downloading FAS cache for %s*" % key)
+            _log.info("Downloading FAS cache for %s*" % key)
             response = fasclient.send_request(
                 '/user/list',
                 req_params={'search': '%s*' % key},
                 auth=True)
         except fedora.client.ServerError as e:
-            log.warning("Failed to download fas cache for %s %r" % (key, e))
+            _log.warning("Failed to download fas cache for %s %r" % (key, e))
             continue
         finally:
             socket.setdefaulttimeout(timeout)
 
-        log.info("Caching necessary user data for %s*" % key)
+        _log.info("Caching necessary user data for %s*" % key)
         for user in response['people']:
             nick = user['ircnick']
             if nick:
@@ -153,12 +153,12 @@ def make_fas_cache(**config):
 
 
 def nick2fas(nickname, **config):
-    log.debug("Acquiring _fas_cache_lock for nicknames.")
+    _log.debug("Acquiring _fas_cache_lock for nicknames.")
     with _fas_cache_lock:
-        log.debug("Got _fas_cache_lock for nicknames.")
+        _log.debug("Got _fas_cache_lock for nicknames.")
         fas_cache = make_fas_cache(**config)
         result = fas_cache.get(nickname, nickname)
-    log.debug("Released _fas_cache_lock for nicknames.")
+    _log.debug("Released _fas_cache_lock for nicknames.")
     return result
 
 
@@ -166,10 +166,10 @@ def email2fas(email, **config):
     if email.endswith('@fedoraproject.org'):
         return email.rsplit('@', 1)[0]
 
-    log.debug("Acquiring _fas_cache_lock for emails.")
+    _log.debug("Acquiring _fas_cache_lock for emails.")
     with _fas_cache_lock:
-        log.debug("Got _fas_cache_lock for emails.")
+        _log.debug("Got _fas_cache_lock for emails.")
         fas_cache = make_fas_cache(**config)
         result = fas_cache.get(email, email)
-    log.debug("Released _fas_cache_lock for emails.")
+    _log.debug("Released _fas_cache_lock for emails.")
     return result
