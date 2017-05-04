@@ -1,14 +1,9 @@
 import collections
+import logging
 import threading
 import socket
 import string
 from hashlib import sha256, md5
-
-_fas_cache = {}
-_fas_cache_lock = threading.Lock()
-
-import logging
-log = logging.getLogger("moksha.hub")
 
 try:
     from six.moves.urllib import parse
@@ -17,6 +12,12 @@ except ImportError:
     # python-2 only usage.  If we're on an old 'six', then we can assume that
     # we must also be on an old Python.
     import urllib as parse
+
+
+_fas_cache = {}
+_fas_cache_lock = threading.Lock()
+
+log = logging.getLogger("moksha.hub")
 
 
 def _ordered_query_params(params):
@@ -105,7 +106,7 @@ def make_fas_cache(**config):
         log.warn("No python-fedora installed.  Not caching fas.")
         return {}
 
-    if not 'fas_credentials' in config:
+    if 'fas_credentials' not in config:
         log.warn("No fas_credentials found.  Not caching fas.")
         return {}
 
