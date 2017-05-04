@@ -42,6 +42,7 @@ except Exception:
 
 
 install_requires = [
+    'dogpile.cache',
     'fedmsg',
     'python-fedora',
     'python-dateutil',

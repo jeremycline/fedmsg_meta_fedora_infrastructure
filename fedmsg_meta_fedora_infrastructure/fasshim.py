@@ -1,10 +1,9 @@
 import collections
 import logging
 import threading
-import socket
-import string
 from hashlib import sha256, md5
 
+from dogpile.cache import make_region
 try:
     from six.moves.urllib import parse
 except ImportError:
@@ -12,12 +11,23 @@ except ImportError:
     # python-2 only usage.  If we're on an old 'six', then we can assume that
     # we must also be on an old Python.
     import urllib as parse
+import fedora.client
+import fedora.client.fas2
 
 
 _log = logging.getLogger(__name__)
 
 _fas_cache = {}
 _fas_cache_lock = threading.Lock()
+
+
+#: The dogpile cache region used to cache results from FAS. By default, it uses
+#: a dictionary backend to cache results. Call ``configure`` on it with
+#: ``replace_existing_backend=True``to alter its configuration. Be aware this will
+#: destroy any existing cached values. If you opt to use a non-memory backend, you
+#: need to handle error cases that may arise from your chosen backend (e.g. connection
+#: exceptions).
+fas_region = make_region().configure('dogpile.cache.memory')
 
 
 def _ordered_query_params(params):
@@ -92,84 +102,90 @@ def avatar_url_from_email(email, size=64, default='retro', dns=False):
         return "https://seccdn.libravatar.org/avatar/%s?%s" % (hash, query)
 
 
-def make_fas_cache(**config):
-    global _fas_cache
-    if _fas_cache:
-        return _fas_cache
+def _search_fas(search_string, fas_credentials, by_email=False):
+    """
+    Search FAS with the given search string.
 
-    _log.warn("No previous fas cache found.  Looking to rebuild.")
-
-    try:
-        import fedora.client
-        import fedora.client.fas2
-    except ImportError:
-        _log.warn("No python-fedora installed.  Not caching fas.")
-        return {}
-
-    if 'fas_credentials' not in config:
-        _log.warn("No fas_credentials found.  Not caching fas.")
-        return {}
-
-    creds = config['fas_credentials']
-
-    default_url = 'https://admin.fedoraproject.org/accounts/'
+    Args:
+        search_string (str): The string to search FAS with.
+        fas_credentials (dict): A dictionary containing at least two keys,
+            'username' and 'password', used to authenticate with FAS. Provide a
+            'base_url' key to specify which FAS instance to query (defaults to
+            'https://admin.fedoraproject.org/accounts/')
+        by_email (bool): Set this to ``True`` if the search string is an email
+            address.
+    """
+    url = fas_credentials.get('base_url', 'https://admin.fedoraproject.org/accounts/')
     fasclient = fedora.client.fas2.AccountSystem(
-        base_url=creds.get('base_url', default_url),
-        username=creds['username'],
-        password=creds['password'],
+        base_url=url,
+        username=fas_credentials['username'],
+        password=fas_credentials['password'],
     )
+    req_params = {'search': search_string}
+    if by_email:
+        req_params['by_email'] = 1
 
-    timeout = socket.getdefaulttimeout()
-    for key in string.ascii_lowercase:
-        socket.setdefaulttimeout(600)
-        try:
-            _log.info("Downloading FAS cache for %s*" % key)
-            response = fasclient.send_request(
-                '/user/list',
-                req_params={'search': '%s*' % key},
-                auth=True)
-        except fedora.client.ServerError as e:
-            _log.warning("Failed to download fas cache for %s %r" % (key, e))
-            continue
-        finally:
-            socket.setdefaulttimeout(timeout)
+    _log.info("Querying %s with %r", url, req_params)
+    response = fasclient.send_request('/user/list', req_params=req_params, auth=True)
 
-        _log.info("Caching necessary user data for %s*" % key)
-        for user in response['people']:
-            nick = user['ircnick']
-            if nick:
-                _fas_cache[nick] = user['username']
+    if not response['people']:
+        raise ValueError('There is no FAS account that matches "{}"'.format(str(req_params)))
 
-            email = user['email']
-            if email:
-                _fas_cache[email] = user['username']
+    # Warm up the cache with whatever we get. Although the ``cache_on_arguments``
+    # decorator will populate the cache for either the email or the ircnick, this
+    # does both to save a second request.
+    email_key_func = fas_region.function_key_generator(None, email2fas)
+    nick_key_func = fas_region.function_key_generator(None, nick2fas)
+    for person in response['people']:
+        fasname = response['username']
+        email = response.get('email')
+        ircnick = response.get('ircnick')
+        if email:
+            fas_region.set(email_key_func(email), fasname)
+        if ircnick:
+            fas_region.set(nick_key_func(ircnick), fasname)
 
-        del response
-
-    del fasclient
-    del fedora.client.fas2
-
-    return _fas_cache
+    return response['people']
 
 
-def nick2fas(nickname, **config):
-    _log.debug("Acquiring _fas_cache_lock for nicknames.")
-    with _fas_cache_lock:
-        _log.debug("Got _fas_cache_lock for nicknames.")
-        fas_cache = make_fas_cache(**config)
-        result = fas_cache.get(nickname, nickname)
-    _log.debug("Released _fas_cache_lock for nicknames.")
-    return result
+@fas_region.cache_on_arguments()
+def nick2fas(nickname, fas_credentials=None, **config):
+    """
+    Get a Fedora Account System username from an IRC nickname.
+
+    Args:
+        nickname (str): The user's IRC nickname to lookup in FAS.
+        fas_credentials (dict): A dictionary containing two keys, 'username'
+            and 'password', used to authenticate with FAS.
+
+    Raises:
+        ValueError: When the IRC nickname provided results in no accounts or
+            when it results in more than one account.
+        fedora.client.ServerError: When a server error occurs during the
+            request.
+    """
+    people = _search_fas(nickname, fas_credentials, by_email=False)
+    if len(people) > 1:
+        raise ValueError('The provided nickname, {}, returns multiple users'
+                         ' in the search'.format(nickname))
+    return people[0]['username']
 
 
-def email2fas(email, **config):
+@fas_region.cache_on_arguments()
+def email2fas(email, fas_credentials=None, **config):
+    """
+    Get a Fedora Account System username from an IRC nickname.
+
+    Args:
+        nickname (str): The user's IRC nickname to lookup in FAS.
+        fas_credentials (dict): A dictionary containing two keys, 'username'
+            and 'password', used to authenticate with FAS.
+    """
     if email.endswith('@fedoraproject.org'):
         return email.rsplit('@', 1)[0]
 
-    _log.debug("Acquiring _fas_cache_lock for emails.")
-    with _fas_cache_lock:
-        _log.debug("Got _fas_cache_lock for emails.")
-        fas_cache = make_fas_cache(**config)
-        result = fas_cache.get(email, email)
-    _log.debug("Released _fas_cache_lock for emails.")
-    return result
+    people = _search_fas(email, fas_credentials, by_email=True)
+    if len(people) > 1:
+        raise ValueError('The provided email, {}, returns multiple users'
+                         ' in the search'.format(email))
+    return people[0]['username']
